@@ -179,25 +179,61 @@ const EYE_L=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
 const EYE_R=[362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
 const LIPS_IN=[78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191];
 let swap=null, swapData=null, imageLandmarker=null, pendingTarget='me';
-const swapCanvas=document.createElement('canvas'), sctx=swapCanvas.getContext('2d');
 
-function det3(m){ return m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]); }
-function solve3(m,v){
-  const D=det3(m); if(Math.abs(D)<1e-9) return null;
-  return [0,1,2].map(c=>det3(m.map((row,r)=>row.map((x,k)=>k===c?v[r]:x)))/D);
+/* geometria */
+function segDist(p,a,b){ const dx=b.x-a.x, dy=b.y-a.y; const t=Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/((dx*dx+dy*dy)||1))); return Math.hypot(p.x-a.x-t*dx, p.y-a.y-t*dy); }
+function distToPoly(p,poly){ let m=1e9; for(let k=0;k<poly.length;k++) m=Math.min(m,segDist(p,poly[k],poly[(k+1)%poly.length])); return m; }
+function inPoly(p,poly){ let ins=false; for(let i=0,j=poly.length-1;i<poly.length;j=i++){ const a=poly[i],b=poly[j]; if(((a.y>p.y)!==(b.y>p.y)) && p.x<(b.x-a.x)*(p.y-a.y)/((b.y-a.y)||1e-9)+a.x) ins=!ins; } return ins; }
+const smooth = a => { a=Math.max(0,Math.min(1,a)); return a*a*(3-2*a); };
+
+/* cor média e variação da pele (parte central do rosto) */
+const statC=document.createElement('canvas'); statC.width=statC.height=40;
+const statX=statC.getContext('2d',{willReadFrequently:true});
+function faceStats(src,pts){
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for(const i of OVAL){ const p=pts[i]; x0=Math.min(x0,p.x); y0=Math.min(y0,p.y); x1=Math.max(x1,p.x); y1=Math.max(y1,p.y); }
+  const bw=x1-x0, bh=y1-y0; if(bw<8||bh<8) return null;
+  statX.clearRect(0,0,40,40);
+  try{ statX.drawImage(src,x0,y0,bw,bh,0,0,40,40); }catch(e){ return null; }
+  const d=statX.getImageData(0,0,40,40).data, s=[0,0,0], q=[0,0,0]; let n=0;
+  for(let y=0;y<40;y++) for(let x=0;x<40;x++){
+    const ex=(x-20)/20, ey=(y-22)/20; if(ex*ex+ey*ey>0.45) continue;
+    const k=(y*40+x)*4; for(let c=0;c<3;c++){ const v=d[k+c]/255; s[c]+=v; q[c]+=v*v; } n++;
+  }
+  if(!n) return null;
+  const m=s.map(v=>v/n); return {m, sd:q.map((v,c)=>Math.sqrt(Math.max(1e-4,v/n-m[c]*m[c])))};
 }
-function warpTri(c,img,s,d){
-  const cx=(d[0].x+d[1].x+d[2].x)/3, cy=(d[0].y+d[1].y+d[2].y)/3;
-  const m=[[s[0].x,s[0].y,1],[s[1].x,s[1].y,1],[s[2].x,s[2].y,1]];
-  const X=solve3(m,[d[0].x,d[1].x,d[2].x]), Y=solve3(m,[d[0].y,d[1].y,d[2].y]);
-  if(!X||!Y) return;
-  c.save(); c.beginPath();
-  d.forEach((p,i)=>{ const x=p.x+(p.x-cx)*0.06, y=p.y+(p.y-cy)*0.06; i?c.lineTo(x,y):c.moveTo(x,y); });
-  c.closePath(); c.clip();
-  c.transform(X[0],Y[0],X[1],Y[1],X[2],Y[2]);
-  c.drawImage(img,0,0); c.restore();
+
+/* WebGL: desenha o rosto da foto deformado sobre o rosto ao vivo */
+const glc=document.createElement('canvas');
+let G=null;
+function initGL(){
+  if(G) return G;
+  const gl=glc.getContext('webgl',{premultipliedAlpha:false,alpha:true,antialias:true});
+  if(!gl) return null;
+  const sh=(t,src)=>{ const s=gl.createShader(t); gl.shaderSource(s,src); gl.compileShader(s); return s; };
+  const pr=gl.createProgram();
+  gl.attachShader(pr,sh(gl.VERTEX_SHADER,`attribute vec2 aPos; attribute vec2 aUv; attribute float aA; uniform vec2 uSize; varying vec2 vUv; varying float vA;
+    void main(){ vUv=aUv; vA=aA; vec2 p=aPos/uSize*2.0-1.0; gl_Position=vec4(p.x,-p.y,0.0,1.0); }`));
+  gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,`precision mediump float; uniform sampler2D uTex; uniform vec3 uMS,uMT,uK; varying vec2 vUv; varying float vA;
+    void main(){ vec3 c=texture2D(uTex,vUv).rgb; c=(c-uMS)*uK+uMT; gl_FragColor=vec4(clamp(c,0.0,1.0),vA); }`));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  G={gl,pr,pos:gl.createBuffer(),uv:gl.createBuffer(),al:gl.createBuffer(),idx:gl.createBuffer(),tex:gl.createTexture(),
+     L:n=>gl.getAttribLocation(pr,n), U:n=>gl.getUniformLocation(pr,n), texFor:null, n:0, posArr:new Float32Array(478*2)};
+  return G;
 }
-function poly(c,idx,pt){ c.beginPath(); idx.forEach((i,k)=>{ const p=pt(i); k?c.lineTo(p.x,p.y):c.moveTo(p.x,p.y); }); c.closePath(); c.fill(); }
+function uploadSwap(){
+  const {gl}=G, s=swap;
+  gl.bindTexture(gl.TEXTURE_2D,G.tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,s.img);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.bindBuffer(gl.ARRAY_BUFFER,G.uv); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(s.pts.flatMap(p=>[p.x/s.img.width,p.y/s.img.height])),gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER,G.al); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(s.alpha),gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,G.idx); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(s.tris),gl.STATIC_DRAW);
+  G.n=s.tris.length; G.texFor=s; G.tStats=null;
+}
 
 async function getImageLandmarker(){
   if(!imageLandmarker){
@@ -209,9 +245,9 @@ async function getImageLandmarker(){
 function loadImg(src){ return new Promise((ok,err)=>{ const i=new Image(); i.onload=()=>ok(i); i.onerror=err; i.src=src; }); }
 async function fileToDataUrl(file){
   const url=URL.createObjectURL(file);
-  try{ const img=await loadImg(url); const k=Math.min(1,720/Math.max(img.naturalWidth,img.naturalHeight));
+  try{ const img=await loadImg(url); const k=Math.min(1,1024/Math.max(img.naturalWidth,img.naturalHeight));
     const c=document.createElement('canvas'); c.width=Math.round(img.naturalWidth*k); c.height=Math.round(img.naturalHeight*k);
-    c.getContext('2d').drawImage(img,0,0,c.width,c.height); return c.toDataURL('image/jpeg',0.85);
+    c.getContext('2d').drawImage(img,0,0,c.width,c.height); return c.toDataURL('image/jpeg',0.9);
   } finally { URL.revokeObjectURL(url); }
 }
 async function prepareSwap(dataUrl, quiet=false){
@@ -220,22 +256,53 @@ async function prepareSwap(dataUrl, quiet=false){
     const c=document.createElement('canvas'); c.width=img.naturalWidth; c.height=img.naturalHeight; c.getContext('2d').drawImage(img,0,0);
     const res=(await getImageLandmarker()).detect(c);
     if(!res.faceLandmarks?.length){ if(!quiet) toast('Não achei um rosto nessa foto 😕 Tente uma de frente.'); return null; }
-    const pts=res.faceLandmarks[0].map(p=>({x:p.x*c.width, y:p.y*c.height}));
-    const sub=[...new Set([...OVAL,...EYE_L,...EYE_R,...LIPS_IN,...pts.map((_,i)=>i).filter(i=>i%2===0)])];
-    const tri=Delaunator.from(sub.map(i=>[pts[i].x,pts[i].y])).triangles;
-    const tris=[]; for(let i=0;i<tri.length;i+=3) tris.push([sub[tri[i]],sub[tri[i+1]],sub[tri[i+2]]]);
-    return {img:c, pts, tris};
+    const pts=res.faceLandmarks[0].slice(0,468).map(p=>({x:p.x*c.width, y:p.y*c.height}));
+    const P=idx=>idx.map(i=>pts[i]);
+    const oval=P(OVAL), eL=P(EYE_L), eR=P(EYE_R), lip=P(LIPS_IN);
+    const fw=Math.hypot(pts[234].x-pts[454].x, pts[234].y-pts[454].y);
+    // transparência suave: some perto da borda do rosto, dos olhos e da boca
+    const alpha=pts.map(p=>{
+      let a=inPoly(p,oval) ? smooth(distToPoly(p,oval)/(0.13*fw)) : 0;
+      for(const h of [eL,eR]) a*= inPoly(p,h) ? 0 : smooth(distToPoly(p,h)/(0.035*fw));
+      a*= inPoly(p,lip) ? 0 : smooth(distToPoly(p,lip)/(0.03*fw));
+      return a;
+    });
+    const tri=Delaunator.from(pts.map(p=>[p.x,p.y])).triangles, tris=[];
+    for(let i=0;i<tri.length;i+=3){
+      const a=pts[tri[i]], b=pts[tri[i+1]], d=pts[tri[i+2]], g={x:(a.x+b.x+d.x)/3, y:(a.y+b.y+d.y)/3};
+      if(!inPoly(g,oval) || inPoly(g,eL) || inPoly(g,eR) || inPoly(g,lip)) continue;
+      tris.push(tri[i],tri[i+1],tri[i+2]);
+    }
+    const st=faceStats(c,pts);
+    return {img:c, pts, tris, alpha, st};
   }catch(e){ console.error(e); if(!quiet) toast('Não consegui usar essa foto 😕'); return null; }
 }
-function drawSwap(f){
-  if(!swap) return;
-  const W=f.W, H=f.H;
-  if(swapCanvas.width!==W||swapCanvas.height!==H){ swapCanvas.width=W; swapCanvas.height=H; } else sctx.clearRect(0,0,W,H);
-  for(const t of swap.tris) warpTri(sctx, swap.img, t.map(i=>swap.pts[i]), t.map(i=>f.R(i)));
-  sctx.globalCompositeOperation='destination-in'; sctx.fillStyle='#000'; poly(sctx,OVAL,f.R);
-  sctx.globalCompositeOperation='destination-out'; poly(sctx,EYE_L,f.R); poly(sctx,EYE_R,f.R); poly(sctx,LIPS_IN,f.R);
-  sctx.globalCompositeOperation='source-over';
-  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1); ctx.globalAlpha=0.96; ctx.drawImage(swapCanvas,0,0); ctx.restore(); ctx.globalAlpha=1;
+let swapFrame=0;
+function drawSwap(f,src=video){
+  if(!swap || !initGL()) return;
+  const {gl}=G, W=f.W, H=f.H;
+  if(glc.width!==W||glc.height!==H){ glc.width=W; glc.height=H; }
+  if(G.texFor!==swap) uploadSwap();
+  // luz/cor do rosto ao vivo (atualiza a cada poucos quadros, de forma suave)
+  if((swapFrame++%4===0) || !G.tStats){
+    const raw=f.lm.slice(0,468).map(p=>({x:p.x*W, y:p.y*H}));
+    const t=faceStats(src,raw);
+    if(t){ if(!G.tStats) G.tStats=t; else for(let c=0;c<3;c++){ G.tStats.m[c]+= (t.m[c]-G.tStats.m[c])*0.35; G.tStats.sd[c]+= (t.sd[c]-G.tStats.sd[c])*0.35; } }
+  }
+  const S=swap.st, T=G.tStats||S;
+  const k=[0,1,2].map(c=> S&&T ? Math.max(0.55,Math.min(1.8,T.sd[c]/S.sd[c])) : 1);
+  for(let i=0;i<468;i++){ G.posArr[i*2]=f.lm[i].x*W; G.posArr[i*2+1]=f.lm[i].y*H; }
+  gl.viewport(0,0,W,H); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND); gl.useProgram(G.pr);
+  gl.bindBuffer(gl.ARRAY_BUFFER,G.pos); gl.bufferData(gl.ARRAY_BUFFER,G.posArr.subarray(0,936),gl.DYNAMIC_DRAW);
+  let l=G.L('aPos'); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,G.uv); l=G.L('aUv'); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,G.al); l=G.L('aA'); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l,1,gl.FLOAT,false,0,0);
+  gl.uniform2f(G.U('uSize'),W,H);
+  gl.uniform3fv(G.U('uMS'),S&&T?S.m:[0,0,0]); gl.uniform3fv(G.U('uMT'),S&&T?T.m:[0,0,0]); gl.uniform3fv(G.U('uK'),k);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,G.tex); gl.uniform1i(G.U('uTex'),0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,G.idx); gl.drawElements(gl.TRIANGLES,G.n,gl.UNSIGNED_SHORT,0);
+  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1); ctx.drawImage(glc,0,0); ctx.restore();
 }
 
 const FX = {
@@ -640,6 +707,15 @@ $('#btnShare').onclick=async()=>{
   }catch(e){}
 };
 
+/* teste interno: troca de rosto entre duas imagens (sem câmera) */
+window.__caretaTest=async(srcUrl,dstUrl)=>{
+  const s=await prepareSwap(srcUrl,true); if(!s) return 'sem rosto na origem';
+  swap=s; const d=await prepareSwap(dstUrl,true); if(!d) return 'sem rosto no destino';
+  const W=d.img.width,H=d.img.height; canvas.width=W; canvas.height=H; G&&(G.tStats=null);
+  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1); ctx.drawImage(d.img,0,0); ctx.restore();
+  const lm=d.pts.map(p=>({x:p.x/W,y:p.y/H})); drawSwap(face(lm,W,H),d.img);
+  return canvas.toDataURL('image/jpeg',0.85);
+};
 loadModel();
 </script>
 </body>
