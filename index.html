@@ -260,11 +260,16 @@ async function prepareSwap(dataUrl, quiet=false){
     const P=idx=>idx.map(i=>pts[i]);
     const oval=P(OVAL), eL=P(EYE_L), eR=P(EYE_R), lip=P(LIPS_IN);
     const fw=Math.hypot(pts[234].x-pts[454].x, pts[234].y-pts[454].y);
+    const browA={x:(pts[105].x+pts[334].x)/2, y:(pts[105].y+pts[334].y)/2};
+    let ux=-(pts[454].y-pts[234].y)/fw, uy=(pts[454].x-pts[234].x)/fw;
+    if(ux*(pts[10].x-pts[152].x)+uy*(pts[10].y-pts[152].y)<0){ ux=-ux; uy=-uy; }
     // transparência suave: some perto da borda do rosto, dos olhos e da boca
     const alpha=pts.map(p=>{
       let a=inPoly(p,oval) ? smooth(distToPoly(p,oval)/(0.13*fw)) : 0;
       for(const h of [eL,eR]) a*= inPoly(p,h) ? 0 : smooth(distToPoly(p,h)/(0.035*fw));
       a*= inPoly(p,lip) ? 0 : smooth(distToPoly(p,lip)/(0.03*fw));
+      const hb=((browA.x-p.x)*ux+(browA.y-p.y)*uy)*-1; // altura acima das sobrancelhas
+      if(hb>0) a*=smooth(1-hb/(0.3*fw));
       return a;
     });
     const tri=Delaunator.from(pts.map(p=>[p.x,p.y])).triangles, tris=[];
