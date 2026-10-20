@@ -269,7 +269,7 @@ async function prepareSwap(dataUrl, quiet=false){
       for(const h of [eL,eR]) a*= inPoly(p,h) ? 0 : smooth(distToPoly(p,h)/(0.035*fw));
       a*= inPoly(p,lip) ? 0 : smooth(distToPoly(p,lip)/(0.03*fw));
       const hb=((browA.x-p.x)*ux+(browA.y-p.y)*uy)*-1; // altura acima das sobrancelhas
-      if(hb>0) a*=smooth(1-hb/(0.3*fw));
+      if(hb>-0.03*fw) a*=smooth(1-(hb+0.03*fw)/(0.17*fw));
       return a;
     });
     const tri=Delaunator.from(pts.map(p=>[p.x,p.y])).triangles, tris=[];
